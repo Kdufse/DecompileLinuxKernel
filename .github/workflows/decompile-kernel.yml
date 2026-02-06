@@ -7,10 +7,26 @@ on:
       - 'kernel'  # 当kernel文件变化时触发
 
 jobs:
-  decompile:
+   decompile-from-release:
     runs-on: ubuntu-latest
     
     steps:
+    - name: Download from latest release
+      id: download
+      uses: robinraju/release-downloader@v1.7
+      with:
+        latest: true
+        fileName: "kernel"
+        
+    - name: Move kernel to workspace
+      run: |
+        if [ -f "kernel" ]; then
+          echo "Kernel downloaded successfully"
+        else
+          # 查找下载的文件
+          find . -name "kernel" -type f | head -1 | xargs -I {} mv {} . || true
+        fi
+
     - name: Checkout repository
       uses: actions/checkout@v4
       
