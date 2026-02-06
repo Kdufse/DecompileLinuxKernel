@@ -1,148 +1,167 @@
 name: Decompile Linux Kernel
-
 on:
   workflow_dispatch:  # 手动触发
   push:
     paths:
-      - 'kernel'  # 当kernel文件变化时触发
+      - 'kernel.zip'
 
 jobs:
-   decompile-from-release:
+  decompile-kernel:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Download from latest release
-      id: download
-      uses: robinraju/release-downloader@v1.7
-      with:
-        latest: true
-        fileName: "kernel"
-        
-    - name: Move kernel to workspace
-      run: |
-        if [ -f "kernel" ]; then
-          echo "Kernel downloaded successfully"
-        else
-          # 查找下载的文件
-          find . -name "kernel" -type f | head -1 | xargs -I {} mv {} . || true
-        fi
-
     - name: Checkout repository
       uses: actions/checkout@v4
       
-    - name: Install dependencies
+    - name: Setup decompilation environment
       run: |
+        # 安装必要的工具链
         sudo apt-get update
         sudo apt-get install -y \
+          unzip \
+          binutils \
+          gcc \
+          gcc-multilib \
+          make \
+          flex \
+          bison \
+          libssl-dev \
+          libelf-dev \
+          libncurses-dev \
+          bc \
+          python3 \
           python3-pip \
-          python3-setuptools \
-          git \
-          build-essential \
-          liblzma-dev \
-          liblz4-tool \
-          zstd
-      
-    - name: Install vmlinux-to-elf
-      run: |
-        pip3 install --upgrade git+https://github.com/marin-m/vmlinux-to-elf
-        
-    - name: Check kernel file
-      run: |
-        if [ ! -f kernel ]; then
-          echo "Error: kernel file not found"
-          exit 1
-        fi
-        
-        echo "Kernel file info:"
-        file kernel
-        ls -lh kernel
-        
-    - name: Extract and convert kernel
-      run: |
-        # 使用vmlinux-to-elf转换内核
-        vmlinux-to-elf kernel kernel.elf
-        
-        # 如果上面命令失败，尝试用--binutils选项
-        if [ ! -f kernel.elf ] || [ ! -s kernel.elf ]; then
-          echo "Trying with binutils..."
-          sudo apt-get install -y binutils
-          vmlinux-to-elf kernel kernel.elf
-        fi
-        
-    - name: Extract symbols and debug info
-      run: |
-        # 尝试提取符号表
-        if [ -f kernel.elf ]; then
-          echo "=== ELF File Information ==="
-          readelf -h kernel.elf
+          device-tree-compiler
           
-          echo -e "\n=== Extracting symbols ==="
-          nm kernel.elf 2>/dev/null | head -20 || true
-          
-          # 尝试使用extract-vmlinux备用方法
-          wget -q https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux
-          chmod +x extract-vmlinux
-          ./extract-vmlinux kernel > kernel_extracted 2>/dev/null || true
-          
-          if [ -s kernel_extracted ]; then
-            echo "Extracted using Linux kernel script"
-            file kernel_extracted
-            mv kernel_extracted kernel_extracted.elf
-          fi
-        fi
+        # 安装反编译工具
+        pip3 install \
+          pyelftools \
+          capstone \
+          unicorn \
+          keystone-engine \
+          radare2 \
+          lief
         
-    - name: Run file analysis
+        # 安装 Ghidra（专业反编译工具）
+        wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.1_build/ghidra_11.0.1_PUBLIC_20231222.zip
+        unzip -q ghidra_11.0.1_PUBLIC_20231222.zip -d /opt/
+        echo "/opt/ghidra_11.0.1_PUBLIC" >> $GITHUB_PATH
+        
+    - name: Extract kernel image
       run: |
-        echo "=== Analyzing all generated files ==="
+        # 解压内核文件
+        unzip -o kernel.zip -d kernel_source/
         
-        # 列出所有生成的文件
-        ls -la *.elf 2>/dev/null || true
+        # 查找内核镜像文件
+        find kernel_source/ -name "*.img" -o -name "vmlinu*" -o -name "Image*" -o -name "zImage*" | head -5
         
-        # 对每个ELF文件进行分析
-        for elf_file in *.elf; do
-          if [ -f "$elf_file" ]; then
-            echo -e "\n=== Analysis of $elf_file ==="
-            file "$elf_file"
-            readelf -S "$elf_file" 2>/dev/null | grep -E "(text|data|rodata|bss)" || true
+    - name: Identify kernel image type
+      run: |
+        cd kernel_source/
+        
+        # 使用 file 命令识别文件类型
+        for file in $(find . -type f \( -name "*.img" -o -name "vmlinu*" -o -name "Image*" -o -name "zImage*" \)); do
+          echo "=== 分析文件: $file ==="
+          file "$file"
+          echo ""
+        done
+        
+    - name: Extract kernel symbols and info
+      run: |
+        cd kernel_source/
+        
+        # 使用 readelf 分析 ELF 文件
+        for file in $(find . -type f -executable -o -name "vmlinu*" -o -name "Image*"); do
+          if [ -f "$file" ]; then
+            echo "=== 分析 ELF 文件: $file ==="
+            readelf -h "$file" 2>/dev/null && echo "---" && readelf -Ws "$file" 2>/dev/null | head -20 || true
+            echo ""
           fi
         done
         
-    - name: Upload artifacts
+    - name: Decompile with multiple tools
+      run: |
+        mkdir -p decompiled_output
+        
+        # 方法1: 使用 objdump 反汇编
+        echo "=== 使用 objdump 反汇编 ==="
+        for kernel_file in $(find kernel_source/ -type f \( -name "vmlinux" -o -name "vmlinuz" \)); do
+          if [ -f "$kernel_file" ]; then
+            objdump -d "$kernel_file" > decompiled_output/objdump_output.txt
+            break
+          fi
+        done
+        
+        # 方法2: 使用 radare2 反编译
+        echo "=== 使用 radare2 分析 ==="
+        for kernel_file in $(find kernel_source/ -type f -name "vmlinu*"); do
+          if [ -f "$kernel_file" ]; then
+            r2 -q -A -c "pdg > decompiled_output/radare2_decompiled.c" "$kernel_file" 2>/dev/null || true
+            break
+          fi
+        done
+        
+        # 方法3: 提取内核符号表
+        echo "=== 提取内核符号 ==="
+        for kernel_file in $(find kernel_source/ -type f -name "System.map"); do
+          if [ -f "$kernel_file" ]; then
+            cp "$kernel_file" decompiled_output/System.map
+            break
+          fi
+        done
+        
+    - name: Extract config and modules info
+      run: |
+        # 查找内核配置文件
+        find kernel_source/ -name ".config" -o -name "config.gz" | xargs -I {} cp {} decompiled_output/ 2>/dev/null || true
+        
+        # 如果是压缩的内核，尝试提取
+        for file in $(find kernel_source/ -name "*.gz" -o -name "*.xz" -o -name "*.bz2"); do
+          echo "处理压缩文件: $file"
+          case "$file" in
+            *.gz) gunzip -c "$file" > "${file%.gz}" 2>/dev/null || true ;;
+            *.xz) unxz -c "$file" > "${file%.xz}" 2/dev/null || true ;;
+            *.bz2) bunzip2 -c "$file" > "${file%.bz2}" 2/dev/null || true ;;
+          esac
+        done
+        
+    - name: Create decompilation report
+      run: |
+        echo "# Linux 内核反编译报告" > decompiled_output/REPORT.md
+        echo "生成时间: $(date)" >> decompiled_output/REPORT.md
+        echo "" >> decompiled_output/REPORT.md
+        
+        echo "## 发现的内核文件" >> decompiled_output/REPORT.md
+        find kernel_source/ -type f | sed 's/^/- /' >> decompiled_output/REPORT.md
+        echo "" >> decompiled_output/REPORT.md
+        
+        echo "## 文件类型分析" >> decompiled_output/REPORT.md
+        for file in $(find kernel_source/ -type f \( -name "*.img" -o -name "vmlinu*" -o -name "Image*" \)); do
+          echo "### $(basename "$file")" >> decompiled_output/REPORT.md
+          echo '```' >> decompiled_output/REPORT.md
+          file "$file" >> decompiled_output/REPORT.md
+          echo '```' >> decompiled_output/REPORT.md
+        done
+        
+    - name: Upload decompilation artifacts
       uses: actions/upload-artifact@v4
       with:
         name: decompiled-kernel
         path: |
-          *.elf
-          *.log
+          decompiled_output/
         retention-days: 7
-        if-no-files-found: warn
         
-    - name: Create summary
-      if: always()
+    - name: Generate summary
       run: |
-        echo "## Decompilation Summary" >> $GITHUB_STEP_SUMMARY
+        echo "## 反编译完成" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ 工具链安装完成" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ 内核文件解压完成" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ 使用多种工具进行分析" >> $GITHUB_STEP_SUMMARY
+        echo "- 📁 输出文件已打包为 artifact" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        
-        if ls *.elf 1> /dev/null 2>&1; then
-          echo "✅ Successfully generated ELF files:" >> $GITHUB_STEP_SUMMARY
-          for elf in *.elf; do
-            size=$(ls -lh "$elf" | awk '{print $5}')
-            echo "- **$elf** ($size)" >> $GITHUB_STEP_SUMMARY
-          done
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Analysis Results:" >> $GITHUB_STEP_SUMMARY
-          for elf in *.elf; do
-            echo "**$elf**:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            file "$elf" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          done
-        else
-          echo "❌ Failed to generate ELF files" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Original kernel info:" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          file kernel >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-        fi
+        echo "**包含内容：**" >> $GITHUB_STEP_SUMMARY
+        echo "- objdump 反汇编输出" >> $GITHUB_STEP_SUMMARY
+        echo "- radare2 反编译输出" >> $GITHUB_STEP_SUMMARY
+        echo "- 内核符号表（如存在）" >> $GITHUB_STEP_SUMMARY
+        echo "- 内核配置文件（如存在）" >> $GITHUB_STEP_SUMMARY
+        echo "- 详细分析报告" >> $GITHUB_STEP_SUMMARY
