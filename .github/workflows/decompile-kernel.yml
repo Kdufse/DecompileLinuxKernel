@@ -1,0 +1,132 @@
+name: Decompile Linux Kernel
+
+on:
+  workflow_dispatch:  # 手动触发
+  push:
+    paths:
+      - 'kernel'  # 当kernel文件变化时触发
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          python3-pip \
+          python3-setuptools \
+          git \
+          build-essential \
+          liblzma-dev \
+          liblz4-tool \
+          zstd
+      
+    - name: Install vmlinux-to-elf
+      run: |
+        pip3 install --upgrade git+https://github.com/marin-m/vmlinux-to-elf
+        
+    - name: Check kernel file
+      run: |
+        if [ ! -f kernel ]; then
+          echo "Error: kernel file not found"
+          exit 1
+        fi
+        
+        echo "Kernel file info:"
+        file kernel
+        ls -lh kernel
+        
+    - name: Extract and convert kernel
+      run: |
+        # 使用vmlinux-to-elf转换内核
+        vmlinux-to-elf kernel kernel.elf
+        
+        # 如果上面命令失败，尝试用--binutils选项
+        if [ ! -f kernel.elf ] || [ ! -s kernel.elf ]; then
+          echo "Trying with binutils..."
+          sudo apt-get install -y binutils
+          vmlinux-to-elf kernel kernel.elf
+        fi
+        
+    - name: Extract symbols and debug info
+      run: |
+        # 尝试提取符号表
+        if [ -f kernel.elf ]; then
+          echo "=== ELF File Information ==="
+          readelf -h kernel.elf
+          
+          echo -e "\n=== Extracting symbols ==="
+          nm kernel.elf 2>/dev/null | head -20 || true
+          
+          # 尝试使用extract-vmlinux备用方法
+          wget -q https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux
+          chmod +x extract-vmlinux
+          ./extract-vmlinux kernel > kernel_extracted 2>/dev/null || true
+          
+          if [ -s kernel_extracted ]; then
+            echo "Extracted using Linux kernel script"
+            file kernel_extracted
+            mv kernel_extracted kernel_extracted.elf
+          fi
+        fi
+        
+    - name: Run file analysis
+      run: |
+        echo "=== Analyzing all generated files ==="
+        
+        # 列出所有生成的文件
+        ls -la *.elf 2>/dev/null || true
+        
+        # 对每个ELF文件进行分析
+        for elf_file in *.elf; do
+          if [ -f "$elf_file" ]; then
+            echo -e "\n=== Analysis of $elf_file ==="
+            file "$elf_file"
+            readelf -S "$elf_file" 2>/dev/null | grep -E "(text|data|rodata|bss)" || true
+          fi
+        done
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: decompiled-kernel
+        path: |
+          *.elf
+          *.log
+        retention-days: 7
+        if-no-files-found: warn
+        
+    - name: Create summary
+      if: always()
+      run: |
+        echo "## Decompilation Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if ls *.elf 1> /dev/null 2>&1; then
+          echo "✅ Successfully generated ELF files:" >> $GITHUB_STEP_SUMMARY
+          for elf in *.elf; do
+            size=$(ls -lh "$elf" | awk '{print $5}')
+            echo "- **$elf** ($size)" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Analysis Results:" >> $GITHUB_STEP_SUMMARY
+          for elf in *.elf; do
+            echo "**$elf**:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            file "$elf" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          done
+        else
+          echo "❌ Failed to generate ELF files" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Original kernel info:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          file kernel >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        fi
